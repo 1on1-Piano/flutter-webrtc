@@ -53,6 +53,16 @@ class WebRTC {
   ///
   /// "androidAudioConfiguration": an AndroidAudioConfiguration object mapped with toMap()
   ///
+  /// "androidAudioSource": (Android only) the microphone source to capture from. "music"
+  ///                       (the default) uses VOICE_RECOGNITION. Also "voiceCommunication"
+  ///                       (upstream behaviour, with the platform's voice processing),
+  ///                       "voiceRecognition", "unprocessed" (VOICE_RECOGNITION where the
+  ///                       device doesn't support UNPROCESSED), "mic" and "camcorder". Every
+  ///                       source except "voiceCommunication" turns the platform
+  ///                       AcousticEchoCanceler/NoiseSuppressor effects off, leaving echo and
+  ///                       noise to the getUserMedia constraints. Ignored when
+  ///                       bypassVoiceProcessing is set.
+  ///
   /// "bypassVoiceProcessing": a boolean that bypasses the audio processing for the audio device.
   ///
   /// "androidUseHardwareAudioProcessing": (Android only) defaults to true. Set to false to leave
