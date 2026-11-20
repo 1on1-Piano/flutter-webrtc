@@ -13,6 +13,15 @@ of a lesson cannot hear it. Our commits make the plugin's Android audio capture
 avoid system voice isolation by default, behind a switch the app can change
 later. iOS, macOS, web, and desktop code is unchanged.
 
+The fork also adds the sync tooling (`tool/1on1/`, this file, and the
+`1on1-sync-upstream` workflow) and removes upstream's
+`.github/workflows/publish.yaml`. That workflow publishes to pub.dev on any tag
+matching `v[0-9]+.[0-9]+.[0-9]+*`, which includes our `v<version>-1on1.<n>`
+release tags. The fork is never published. The first release tag,
+`v1.3.0-1on1.1`, predates this removal, so push it before Actions is enabled on
+the fork, or that push starts a (failing) publish run. "Sync by hand" below
+covers keeping the workflow deleted when upstream changes it.
+
 The authoritative list of our changes is the commit history. Every commit of
 ours has a subject starting with `[1on1] `:
 
@@ -104,6 +113,11 @@ git cherry-pick --continue        # repeat for further conflicts
 bash "$(git rev-parse --git-path 1on1-sync)/sync_upstream.sh" --continue
 ```
 
+A modify/delete or rename/delete conflict on a workflow file (`git status`
+shows `UD`) means upstream changed a workflow our commits delete, such as the
+pub.dev publish workflow. Keep it deleted: run `git rm <the path git lists>`,
+not `git add`, which would bring the workflow back.
+
 Use `--abort` the same way to give up: it returns you to your previous branch and
 deletes the sync branch. (The script runs from a copy in `.git/`, because the
 replay may not have restored `tool/1on1/` yet.)
@@ -111,6 +125,21 @@ replay may not have restored `tool/1on1/` yet.)
 **If the checks fail,** the sync branch is kept. Fix the problem with a new
 `[1on1]` commit on it and run the checks again by hand: `flutter pub get`,
 `flutter analyze`, and `flutter build apk --debug` in `example/`.
+
+**Before landing a sync,** check that no workflow on the branch would run when
+we push a release tag. Upstream may rename its publish workflow or add a new
+one, and that replays without a conflict. List the workflows upstream added or
+changed, and read the `on:` block of each:
+
+```sh
+git diff --name-status <old base tag> <new tag> -- .github/workflows/
+git grep -n -E -A8 '^on:' 1on1/sync-<tag> -- .github/workflows/   # every on: block
+```
+
+A workflow runs on our tags if its `on:` (block or one-line form such as
+`on: [push, create]`) has `tags:`, `tags-ignore:`, `create`, or `release`, or a
+`push` with no `branches:` filter. If one does, delete that file in a new
+`[1on1] ci:` commit on the sync branch.
 
 **Landing a sync.** Push the branch (`git push origin 1on1/sync-<tag>`, or pass
 `--push` to the script) and open a PR into `1on1/main`. Merge it with
@@ -144,6 +173,9 @@ Repository settings it needs:
   default branch.
 - "Allow GitHub Actions to create and approve pull requests" turned on, for
   the PR step.
+
+Before merging a sync that CI proposed, run the same "Before landing a sync"
+check as for a manual sync.
 
 **Expect the push to be refused.** GitHub refuses pushes made with the
 workflow token (`GITHUB_TOKEN`) that add or change files under
