@@ -1,0 +1,271 @@
+# Weekly check for a new upstream flutter-webrtc release. When there is one,
+# replays the fork's [1on1] commits onto it with tool/1on1/sync_upstream.sh,
+# runs the Flutter checks, pushes 1on1/sync-<tag>, and opens a PR into
+# 1on1/main. Conflicts and failures open an issue instead. See FORK.md.
+#
+# Two jobs: "check" runs upstream's not-yet-reviewed code (pub packages,
+# Gradle) with a read-only token; "propose" gets the result as a git bundle and
+# does the writes without running any of that code.
+#
+# Scheduled runs use the copy of this file on the repository's default
+# branch, so the fork's default branch must be 1on1/main.
+name: 1on1 sync upstream
+
+on:
+  schedule:
+    - cron: '23 7 * * 1' # Mondays 07:23 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to sync to (empty for the newest stable release)
+        required: false
+        default: ''
+      skip_build:
+        description: Skip the debug APK build
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: 1on1-sync-upstream
+  cancel-in-progress: false
+
+env:
+  MAIN_BRANCH: 1on1/main
+  UPSTREAM_URL: https://github.com/flutter-webrtc/flutter-webrtc.git
+  # Keep in step with flutter_version.lock in the app repository.
+  FLUTTER_VERSION: 3.44.8
+
+jobs:
+  check:
+    name: Replay and check
+    # Never run in upstream or in anyone else's fork of this repository.
+    if: github.repository == '1on1-Piano/flutter-webrtc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.sync.outputs.status || steps.plan.outputs.status }}
+      target: ${{ steps.plan.outputs.target }}
+      branch: ${{ steps.plan.outputs.branch }}
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.MAIN_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream release tags
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream 'refs/tags/*:refs/tags/*'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Run a copy: the sync checks out the upstream tag, which replaces
+          # the working tree.
+          cp tool/1on1/sync_upstream.sh "$RUNNER_TEMP/sync_upstream.sh"
+          mkdir -p "$RUNNER_TEMP/out"
+
+      - name: Look for a new upstream release
+        id: plan
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          out="$RUNNER_TEMP/out/plan.json"
+          args=(--dry-run --skip-if-proposed --status-file "$out")
+          if [ -n "$TAG" ]; then args+=(--tag "$TAG"); fi
+          rc=0
+          bash "$RUNNER_TEMP/sync_upstream.sh" "${args[@]}" || rc=$?
+          echo "Exit code $rc"
+          [ -f "$out" ] ||
+            echo '{"status":"error","message":"the sync script exited before writing its status"}' >"$out"
+          {
+            echo "status=$(jq -r .status "$out")"
+            echo "prediction=$(jq -r '.prediction // ""' "$out")"
+            echo "target=$(jq -r '.target // ""' "$out")"
+            echo "branch=$(jq -r '.branch // ""' "$out")"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        if: steps.plan.outputs.status == 'dry-run' && steps.plan.outputs.prediction != 'conflict'
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter
+        if: steps.plan.outputs.status == 'dry-run' && steps.plan.outputs.prediction != 'conflict'
+        run: |
+          git clone --quiet --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          "$RUNNER_TEMP/flutter/bin/flutter" config --no-analytics
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
+          echo "$RUNNER_TEMP/flutter/bin" >>"$GITHUB_PATH"
+
+      - name: Replay onto the new release and run the checks
+        id: sync
+        if: steps.plan.outputs.status == 'dry-run'
+        env:
+          TARGET: ${{ steps.plan.outputs.target }}
+          SKIP_BUILD: ${{ inputs.skip_build }}
+        run: |
+          out="$RUNNER_TEMP/out/sync.json"
+          args=(--tag "$TARGET" --status-file "$out")
+          if [ "$SKIP_BUILD" = true ]; then args+=(--skip-build); fi
+          rc=0
+          bash "$RUNNER_TEMP/sync_upstream.sh" "${args[@]}" || rc=$?
+          echo "Exit code $rc"
+          [ -f "$out" ] ||
+            echo '{"status":"error","message":"the sync script exited before writing its status"}' >"$out"
+          echo "status=$(jq -r .status "$out")" >>"$GITHUB_OUTPUT"
+
+      - name: Bundle the sync branch
+        if: steps.sync.outputs.status == 'synced'
+        env:
+          BRANCH: ${{ steps.plan.outputs.branch }}
+        run: |
+          git bundle create "$RUNNER_TEMP/out/sync.bundle" "refs/heads/$BRANCH" "^refs/heads/$MAIN_BRANCH"
+          git bundle list-heads "$RUNNER_TEMP/out/sync.bundle"
+
+      - name: Upload the result
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: 1on1-sync
+          path: ${{ runner.temp }}/out
+          if-no-files-found: ignore
+          retention-days: 30
+
+  propose:
+    name: Open a PR or issue
+    needs: check
+    if: >-
+      !cancelled() && github.repository == '1on1-Piano/flutter-webrtc' &&
+      needs.check.outputs.status != 'up-to-date' && needs.check.outputs.status != 'already-proposed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # push the 1on1/sync-<tag> branch
+      pull-requests: write # open the sync PR
+      issues: write # report conflicts and failures
+    env:
+      STATUS: ${{ needs.check.outputs.status }}
+      TARGET: ${{ needs.check.outputs.target }}
+      BRANCH: ${{ needs.check.outputs.branch }}
+    steps:
+      - name: Download the result
+        id: result
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: 1on1-sync
+          path: ${{ runner.temp }}/in
+
+      - name: Check out the fork
+        if: needs.check.outputs.status == 'synced'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.MAIN_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push the sync branch
+        id: push
+        if: needs.check.outputs.status == 'synced'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags "$RUNNER_TEMP/in/sync.bundle" "refs/heads/$BRANCH:refs/heads/$BRANCH"
+          gh auth setup-git
+          if git push "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/$BRANCH:refs/heads/$BRANCH" 2>"$RUNNER_TEMP/push.err"; then
+            echo "pushed=true" >>"$GITHUB_OUTPUT"
+          else
+            cat "$RUNNER_TEMP/push.err"
+            echo "pushed=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the sync PR
+        id: pr
+        if: steps.push.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jq -r .report "$RUNNER_TEMP/in/sync.json" >"$RUNNER_TEMP/pr-body.md"
+          if gh pr create --repo "$GITHUB_REPOSITORY" --base "$MAIN_BRANCH" --head "$BRANCH" \
+            --title "[1on1] Sync with upstream $TARGET" --body-file "$RUNNER_TEMP/pr-body.md"; then
+            echo "opened=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "opened=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Report a conflict or failure in an issue
+        if: >-
+          !cancelled() && (needs.check.outputs.status != 'synced' ||
+          steps.push.outputs.pushed != 'true' || steps.pr.outputs.opened != 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          OPENED: ${{ steps.pr.outputs.opened }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          status_json="$RUNNER_TEMP/in/sync.json"
+          [ -f "$status_json" ] || status_json="$RUNNER_TEMP/in/plan.json"
+          [ -f "$status_json" ] || { status_json="$RUNNER_TEMP/none.json"; echo '{}' >"$status_json"; }
+          message=$(jq -r '.message // ""' "$status_json")
+          push_err='the push step failed before pushing; see the run log'
+          if [ -f "$RUNNER_TEMP/push.err" ]; then push_err=$(tr '\n' ' ' <"$RUNNER_TEMP/push.err"); fi
+          case "$STATUS" in
+          synced)
+            if [ "$PUSHED" != true ]; then
+              what='branch push refused'
+              detail="The replay and checks passed, but the workflow could not push \`$BRANCH\` (git: $push_err). GitHub refuses \`GITHUB_TOKEN\` pushes that add or change files under \`.github/workflows/\`, which every sync does, so that is the usual cause. Push the tested branch from this run yourself:
+
+          \`\`\`sh
+          git switch $MAIN_BRANCH && git pull
+          gh run download $RUN_ID --repo $GITHUB_REPOSITORY --name 1on1-sync --dir /tmp/1on1-sync
+          git fetch /tmp/1on1-sync/sync.bundle 'refs/heads/$BRANCH:refs/heads/$BRANCH'
+          git push origin '$BRANCH'
+          \`\`\`
+
+          Then open a PR from \`$BRANCH\` into \`$MAIN_BRANCH\` with the text below."
+            else
+              what='PR not opened'
+              detail="\`$BRANCH\` was pushed, but the workflow could not open the PR (check that Actions may create pull requests in the repository settings). Open a PR from \`$BRANCH\` into \`$MAIN_BRANCH\` with the text below."
+            fi
+            ;;
+          conflict) what='conflict'; detail='' ;;
+          checks-failed)
+            what='checks failed'
+            detail="The replay applied, but the Flutter checks failed: $message. Reproduce locally with \`tool/1on1/sync_upstream.sh --tag $TARGET\`."
+            ;;
+          *)
+            what='sync error'
+            detail="The sync did not finish (status '${STATUS:-none}', check job: $CHECK_RESULT). ${message:-See the run log.}"
+            ;;
+          esac
+          title="Upstream sync to ${TARGET:-a new release}: $what"
+          {
+            [ -z "$detail" ] || printf '%s\n\n' "$detail"
+            jq -r '.report // ""' "$status_json"
+            printf '\nWorkflow run: %s\n' "$RUN_URL"
+          } >"$RUNNER_TEMP/issue-body.md"
+          export TITLE="$title"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" \
+            --json number,title --jq 'map(select(.title == $ENV.TITLE)) | .[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/issue-body.md"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/issue-body.md"
+          fi
+
+      - name: Fail the run on a sync error
+        if: >-
+          !cancelled() && (needs.check.result == 'failure' ||
+          (needs.check.outputs.status != 'synced' && needs.check.outputs.status != 'conflict' &&
+           needs.check.outputs.status != 'checks-failed'))
+        run: exit 1
