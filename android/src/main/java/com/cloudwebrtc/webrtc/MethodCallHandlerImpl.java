@@ -27,6 +27,7 @@ import com.cloudwebrtc.webrtc.audio.AudioDeviceKind;
 import com.cloudwebrtc.webrtc.audio.AudioProcessingController;
 import com.cloudwebrtc.webrtc.audio.AudioSwitchManager;
 import com.cloudwebrtc.webrtc.audio.AudioUtils;
+import com.cloudwebrtc.webrtc.audio.CaptureAudioSource;
 import com.cloudwebrtc.webrtc.audio.LocalAudioTrack;
 import com.cloudwebrtc.webrtc.audio.PlaybackSamplesReadyCallbackAdapter;
 import com.cloudwebrtc.webrtc.audio.RecordSamplesReadyCallbackAdapter;
@@ -243,6 +244,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
                         .setUseLowLatency(useLowLatency)
                         .setUseHardwareNoiseSuppressor(useHardwareAudioProcessing);
     }
+    if (!bypassVoiceProcessing) {
+      CaptureAudioSource.apply(context, audioDeviceModuleBuilder, androidAudioSource);
+    }
 
     // Configure audio sample rates if specified
     // This allows high-quality audio playback instead of defaulting to WebRtcAudioManager's queried rate
@@ -343,6 +347,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
   }
 
+  @Nullable
+  private String androidAudioSource;
+
   @Override
   public void onMethodCall(MethodCall call, @NonNull Result notSafeResult) {
 
@@ -352,6 +359,10 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         int networkIgnoreMask = Options.ADAPTER_TYPE_UNKNOWN;
         Map<String, Object> options = call.argument("options");
         ConstraintsMap constraintsMap = new ConstraintsMap(options);
+        if (constraintsMap.hasKey(CaptureAudioSource.OPTION_KEY)
+                && constraintsMap.getType(CaptureAudioSource.OPTION_KEY) == ObjectType.String) {
+          androidAudioSource = constraintsMap.getString(CaptureAudioSource.OPTION_KEY);
+        }
         if (constraintsMap.hasKey("networkIgnoreMask")
                 && constraintsMap.getType("networkIgnoreMask") == ObjectType.Array) {
           final ConstraintsArray ignoredAdapters = constraintsMap.getArray("networkIgnoreMask");
